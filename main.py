@@ -1,18 +1,13 @@
 import serial
 import pynmea2
+import threading
+import time
 
 from pyproj import Proj
 
 
 PORT = "/dev/ttyACM0"
-BAUDRATE = 4800   # prueba 4800 si no funciona
-TIME = 1
-LATITUDE = 2
-LATITUDE_NS = 3
-LONGITUDE = 4
-LONGITUDE_EW = 5
-ALTITUDE = 9
-ALTITUDE_UNITS = 10
+BAUDRATE = 4800
 
 
 def ggaToUtm(tramaGga):
@@ -31,26 +26,33 @@ def ggaToUtm(tramaGga):
     return utm_easting, utm_northing, zone, hemisphere
 
 
+def getGpsData():
 
-try:
-    ser = serial.Serial(PORT, BAUDRATE, timeout=1)
-    print("Leyendo datos del GPS...\n")
+    try:
+        ser = serial.Serial(PORT, BAUDRATE, timeout=1)
+        print("Leyendo datos del GPS...\n")
 
-    while True:
-        line = ser.readline().decode("ascii").strip()
+        while True:
+            line = ser.readline().decode("ascii").strip()
 
-        if line.startswith("$GPGGA"):
+            if line.startswith("$GPGGA"):
 
-            print(ggaToUtm((line)))
-
-
-except serial.SerialException as e:
-    print(f"Error abriendo el puerto: {e}")
-except KeyboardInterrupt:
-    print("\nSaliendo...")
-finally:
-    if 'ser' in locals() and ser.is_open:
-        ser.close()
+                print(ggaToUtm((line)))
 
 
+    except serial.SerialException as e:
+        print(f"Error abriendo el puerto: {e}")
+    except KeyboardInterrupt:
+        print("\nSaliendo...")
+    finally:
+        if 'ser' in locals() and ser.is_open:
+            ser.close()
 
+
+threads = [threading.Thread(target=getGpsData)]
+
+for t in threads:
+    t.start()
+
+for t in threads:
+    t.join()
