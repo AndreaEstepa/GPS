@@ -1,26 +1,25 @@
-# Proyecto de Lectura y Conversión de Datos GPS en Python
+# Proyecto GPS con visualizacion en mapa
 
-Este proyecto es una aplicación en **Python** que lee datos de un dispositivo **GPS** conectado vía **puerto serial** (`/dev/ttyACM0` a `4800` baudios).
+Aplicacion en Python que lee tramas NMEA por puerto serie, convierte la posicion a UTM y muestra la posicion sobre `etsisi.png` en tiempo real.
 
-## Funcionamiento del archivo `main.py`
+## Que hace `main.py`
 
-El código principal en `main.py` realiza las siguientes tareas:
+- Lee sentencias `$GPGGA` desde `/dev/ttyACM0` a `4800` baudios.
+- Convierte lat/lon a UTM con `pyproj`.
+- Transforma UTM a coordenadas de pixel usando los limites georreferenciados de la imagen.
+- Dibuja y actualiza un punto rojo sobre el mapa con `matplotlib`.
+- Usa un hilo para adquisicion GPS y el hilo principal para la interfaz grafica.
 
-- Utiliza la biblioteca **pynmea2** para parsear tramas **NMEA**, específicamente las sentencias **`$GPGGA`**, extrayendo **latitud** y **longitud**.
-- Convierte las **coordenadas geográficas** a **coordenadas UTM (Universal Transverse Mercator)** utilizando **pyproj**, determinando la **zona** y el **hemisferio** automáticamente.
-- Imprime las **coordenadas UTM resultantes** en tiempo real:
-  - `easting`
-  - `northing`
-  - `zona`
-  - `hemisferio`
-- Maneja **errores de conexión serial** y permite **interrupción manual** (`Ctrl+C`).
-- Emplea **threading** para ejecutar la lectura en un **hilo separado**, aunque actualmente solo se utiliza **un hilo**.
+## Instalacion
 
-## Objetivo del proyecto
+```bash
+python3 -m pip install -r requirements.txt
+```
 
-El proyecto parece enfocado en el **procesamiento y conversión de datos GPS** para aplicaciones de **posicionamiento**, posiblemente en un entorno **Linux** con hardware GPS compatible.
+## Ejecucion
 
-## Repositorio
+```bash
+python3 main.py
+```
 
-- **Repositorio Git:** `git@github.com:AndreaEstepa/GPS.git`  
-- **Rama:** `main`
+Si el dispositivo no esta en `/dev/ttyACM0`, cambia `PORT` en `main.py`.
