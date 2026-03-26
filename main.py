@@ -10,12 +10,12 @@ from pyproj import Proj
 
 PORT = "/dev/ttyACM0"
 BAUDRATE = 4800
-SUPIZQ_X = 446006.42
-SUPIZQ_Y = 4470850.84
-INFDER_X = 447061.97
-INFDER_Y = 4471224.42
-WIDTH_IMG = 1802
-HEIGHT_IMG = 626
+SUPIZQ_X = 446231.13
+SUPIZQ_Y = 4471354.38
+INFDER_X = 446982.81
+INFDER_Y = 4470671.80
+WIDTH_IMG = 897
+HEIGHT_IMG = 804
 
 def getPixMet(supIzq, infDer, widthImg, heightImg):
     deltaX = infDer[0] - supIzq[0]
