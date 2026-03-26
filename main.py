@@ -14,20 +14,21 @@ SUPIZQ_X = 446231.13
 SUPIZQ_Y = 4471354.38
 INFDER_X = 446982.81
 INFDER_Y = 4470671.80
-WIDTH_IMG = 897
-HEIGHT_IMG = 804
 
-def getPixMet(supIzq, infDer, widthImg, heightImg):
-    deltaX = infDer[0] - supIzq[0]
-    deltaY = infDer[1] - supIzq[1]
+
+def getPixMet(widthImg, heightImg):
+    deltaX = INFDER_X - SUPIZQ_X
+    deltaY = SUPIZQ_Y - INFDER_Y
 
     pixPerMeterX = widthImg / deltaX
     pixPerMeterY = heightImg / deltaY
 
+    print(f"Pixeles por metro: X={pixPerMeterX:.2f}, Y={pixPerMeterY}")
+
     return (pixPerMeterX + pixPerMeterY) /2
 
 def transformUTMtoPix(posX, posY, pixToMet):
-    return (posX-SUPIZQ_X) * pixToMet, (posY-SUPIZQ_Y) * pixToMet
+    return (posX-SUPIZQ_X) * pixToMet, (SUPIZQ_Y-posY) * pixToMet
 
 def ggaToUtm(tramaGga):
     msg = pynmea2.parse(tramaGga)
@@ -79,15 +80,15 @@ def getGpsData(pixToMet, positionQueue, stopEvent):
             ser.close()
 
 
-def showMap(positionQueue, stopEvent):
+def showMap(positionQueue, stopEvent, widthImg, heightImg):
     imagePath = Path(__file__).with_name("etsisi.png")
     image = plt.imread(imagePath)
 
     fig, ax = plt.subplots(figsize=(16, 6))
     ax.imshow(image)
     ax.set_title("Posicion GPS en tiempo real")
-    ax.set_xlim(0, WIDTH_IMG)
-    ax.set_ylim(HEIGHT_IMG, 0)
+    ax.set_xlim(0, widthImg)
+    ax.set_ylim(heightImg, 0)
     ax.grid(alpha=0.2)
 
     point = ax.scatter([], [], c="red", s=80)
@@ -124,9 +125,17 @@ def showMap(positionQueue, stopEvent):
     if plt.fignum_exists(fig.number):
         plt.close(fig)
 
+def getImageSize(imagePath):
+    image = plt.imread(imagePath)
+    height, width = image.shape[:2]
+    return width, height
+
 
 if __name__ == "__main__":
-    pixToMet = getPixMet([SUPIZQ_X, SUPIZQ_Y], [INFDER_X, INFDER_Y], WIDTH_IMG, HEIGHT_IMG)
+    imagePath = Path(__file__).with_name("etsisi.png")
+    widthImg, heightImg = getImageSize(imagePath)
+
+    pixToMet = getPixMet(widthImg, heightImg)
     positionQueue = queue.Queue(maxsize=1)
     stopEvent = threading.Event()
 
@@ -136,7 +145,7 @@ if __name__ == "__main__":
     )
     mapThread = threading.Thread(
         target=showMap,
-        args=(positionQueue, stopEvent),
+        args=(positionQueue, stopEvent, widthImg, heightImg),
     )
 
     gpsThread.start()
