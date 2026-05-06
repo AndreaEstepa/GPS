@@ -1,10 +1,16 @@
+import time
+from io import BytesIO
+
+import requests
 import serial
 import pynmea2
 import threading
 import queue
 from pathlib import Path
+from urllib.parse import quote
 
 import matplotlib.pyplot as plt
+from PIL import Image
 from matplotlib.widgets import CheckButtons
 from pyproj import Proj
 from datetime import datetime
@@ -115,6 +121,15 @@ def transformUTMtoPix(posX, posY, pixToMet):
     return (posX-SUPIZQ_X) * pixToMet, (SUPIZQ_Y-posY) * pixToMet
 
 def ggaToUtm(tramaGga):
+    lat,lon,zone,hemisphere = ggaToLatLong(tramaGga)
+
+    proj_utm = Proj(proj='utm', zone=zone, ellps='WGS84', hemisphere=hemisphere)
+
+    utm_easting, utm_northing = proj_utm(lon, lat)
+
+    return utm_easting, utm_northing, zone, hemisphere
+
+def ggaToLatLong(tramaGga):
     msg = pynmea2.parse(tramaGga)
 
     lat = msg.latitude
@@ -123,11 +138,7 @@ def ggaToUtm(tramaGga):
     zone = int((lon + 180) / 6) + 1
     hemisphere = 'north' if lat >= 0 else 'south'
 
-    proj_utm = Proj(proj='utm', zone=zone, ellps='WGS84', hemisphere=hemisphere)
-
-    utm_easting, utm_northing = proj_utm(lon, lat)
-
-    return utm_easting, utm_northing, zone, hemisphere
+    return lat,lon,zone,hemisphere
 
 
 def getDistanceKm(pos1, pos2):
@@ -159,7 +170,8 @@ def getGpsData(pixToMet, positionQueue, speedQueue, stopEvent):
 
             if line.startswith("$GPGGA"):
                 try:
-                    pos = ggaToUtm(line)
+                    pos = ggaToLatLong(line)
+                    posUTM = ggaToUtm(line)
                 except pynmea2.ParseError:
                     continue
 
@@ -172,10 +184,10 @@ def getGpsData(pixToMet, positionQueue, speedQueue, stopEvent):
                 previousPos = pos
                 previousTime = datetime.now()
 
-                print(f"Posición UTM: ({pos[0]:.2f}, {pos[1]:.2f}), Velocidad: {speed:.2f} km/h")
+                print(f"Posición UTM: ({posUTM[0]:.2f}, {posUTM[1]:.2f}), Velocidad: {speed:.2f} km/h")
 
 
-                xPix, yPix = transformUTMtoPix(pos[0], pos[1], pixToMet)
+                xPix, yPix = transformUTMtoPix(posUTM[0], posUTM[1], pixToMet)
 
                 # Solo mantiene el dato mas reciente para que la UI no acumule retraso.
                 if positionQueue.full():
@@ -199,13 +211,26 @@ def getGpsData(pixToMet, positionQueue, speedQueue, stopEvent):
         if ser is not None and ser.is_open:
             ser.close()
 
+def latLonToBbox(lat, lon, delta=0.005):
+    min_lat = lat - delta
+    max_lat = lat + delta
+    min_lon = lon - delta
+    max_lon = lon + delta
+
+    return f"{min_lon},{min_lat},{max_lon},{max_lat}"
 
 def showMap(positionQueue, speedQueue, stopEvent, widthImg, heightImg):
-    imagePath = Path(__file__).with_name("etsisi.png")
-    image = plt.imread(imagePath)
+    print(latLonToBbox(40.389, -3.628))
+    last_update = 0
+    update_interval = 5.0
+
+    request = requests.get("https://www.ign.es/wms-inspire/pnoa-ma?SERVICE=WMS&VERSION=1.3.0&REQUEST=GetMap&LAYERS=OI.OrthoimageCoverage&CRS=EPSG%3A4326&BBOX=40.386%2C-3.633%2C40.393%2C-3.623&WIDTH=1000&HEIGHT=800&FORMAT=image%2Fpng",stream=True)
+    request.raw.decode_content = True
+    print("OwO", request.raw)
+    image = Image.open(request.raw)
 
     fig, ax = plt.subplots(figsize=(16, 6))
-    ax.imshow(image)
+    img_plot = ax.imshow(image)
     ax.set_title("Posicion GPS en tiempo real")
     ax.set_xlim(0, widthImg)
     ax.set_ylim(heightImg, 0)
@@ -297,14 +322,51 @@ def showMap(positionQueue, speedQueue, stopEvent, widthImg, heightImg):
                 break
 
         if latestPoint[0] is not None:
-            xPix, yPix, utmX, utmY = latestPoint
+            xPix, yPix, lat, lon = latestPoint
             point.set_offsets([[xPix, yPix]])
-            label.set_text(f"UTM: ({utmX:.2f}, {utmY:.2f})  Pix: ({xPix:.1f}, {yPix:.1f})")
+            label.set_text(f"Lat Lon: ({lat:.2f}, {lon:.2f})  Pix: ({xPix:.1f}, {yPix:.1f})")
 
             # Encontrar el punto más cercano y obtener velocidad de referencia
-            nearestPoint = findNearestPoint(utmY, utmX, speedPoints)
+            nearestPoint = findNearestPoint(lat, lon, speedPoints)
             if nearestPoint:
                 referenceSpeed = nearestPoint[2]
+
+            if time.time() - last_update > update_interval:
+                last_update = time.time()
+
+                try:
+                    bbox = latLonToBbox(lat, lon)
+
+                    request = requests.get(
+                        "https://www.ign.es/wms-inspire/pnoa-ma",
+                        params={
+                            "SERVICE": "WMS",
+                            "VERSION": "1.3.0",
+                            "REQUEST": "GetMap",
+                            "LAYERS": "OI.OrthoimageCoverage",
+                            "CRS": "EPSG:4326",
+                            "BBOX": bbox,
+                            "WIDTH": "1000",
+                            "HEIGHT": "800",
+                            "FORMAT": "image/png"
+                        },
+                        timeout=5
+                    )
+
+                    if request.status_code == 200:
+                        content_type = request.headers.get("Content-Type", "")
+
+                        if "image" in content_type:
+                            image = Image.open(BytesIO(request.content))
+                            img_plot.set_data(image)
+                        else:
+                            print("Respuesta no es imagen:")
+                            print(request.text[:300])
+                    else:
+                        print("Error WMS:", request.status_code)
+
+                except Exception as e:
+                    print("Error descargando imagen:", e)
 
         speedColor = getSpeedColor(latestSpeed, referenceSpeed)
         speedLabel.set_text(f"Velocidad: {latestSpeed:.2f} km/h")
