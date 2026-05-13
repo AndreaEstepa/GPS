@@ -224,10 +224,43 @@ def showMap(positionQueue, speedQueue, stopEvent, widthImg, heightImg):
     last_update = 0
     update_interval = 5.0
 
-    request = requests.get("https://www.ign.es/wms-inspire/pnoa-ma?SERVICE=WMS&VERSION=1.3.0&REQUEST=GetMap&LAYERS=OI.OrthoimageCoverage&CRS=EPSG%3A4326&BBOX=40.386%2C-3.633%2C40.393%2C-3.623&WIDTH=1000&HEIGHT=800&FORMAT=image%2Fpng",stream=True)
-    request.raw.decode_content = True
-    print("OwO", request.raw)
-    image = Image.open(request.raw)
+    request = requests.get(
+        "https://www.ign.es/wms-inspire/pnoa-ma",
+        params={
+            "SERVICE": "WMS",
+            "VERSION": "1.3.0",
+            "REQUEST": "GetMap",
+            "LAYERS": "OI.OrthoimageCoverage",
+            "CRS": "EPSG:4326",
+            "BBOX": "40.386,-3.633,40.393,-3.623",  # lat_min,lon_min,lat_max,lon_max
+            "WIDTH": "1000",
+            "HEIGHT": "800",
+            "FORMAT": "image/png",
+        },
+        timeout=10,
+    )
+
+    print("HTTP:", request.status_code, "CT:", request.headers.get("Content-Type", ""))
+
+    if request.status_code == 200:
+        content_type = request.headers.get("Content-Type", "").lower()
+
+        with open("debug_wms_response.bin", "wb") as f:
+            f.write(request.content)
+
+        if "image/png" in content_type or "image" in content_type:
+            with open("debug_wms_image.png", "wb") as f:
+                f.write(request.content)
+
+            image = Image.open(BytesIO(request.content))
+            image.load()  # fuerza decode real
+            print("OK imagen PNG")
+        else:
+            with open("debug_wms_error.xml", "w", encoding="utf-8") as f:
+                f.write(request.text)
+            print("WMS devolvió texto/XML, no imagen")
+    else:
+        print("HTTP error:", request.status_code)
 
     fig, ax = plt.subplots(figsize=(16, 6))
     img_plot = ax.imshow(image)
@@ -348,25 +381,44 @@ def showMap(positionQueue, speedQueue, stopEvent, widthImg, heightImg):
                             "BBOX": bbox,
                             "WIDTH": "1000",
                             "HEIGHT": "800",
-                            "FORMAT": "image/png"
+                            "FORMAT": "image/png",
                         },
-                        timeout=5
+                        timeout=10,
                     )
 
+                    content_type = request.headers.get("Content-Type", "").lower()
+                    print("WMS update -> HTTP:", request.status_code, "CT:", content_type, "BBOX:", bbox)
+
                     if request.status_code == 200:
-                        content_type = request.headers.get("Content-Type", "")
+                        # Guarda siempre último binario recibido (útil debug)
+                        with open("debug_wms_update_response.bin", "wb") as f:
+                            f.write(request.content)
 
                         if "image" in content_type:
-                            image = Image.open(BytesIO(request.content))
-                            img_plot.set_data(image)
+                            try:
+                                new_image = Image.open(BytesIO(request.content))
+                                new_image.load()  # fuerza decode para detectar corrupciones
+                                img_plot.set_data(new_image)
+
+                                # opcional: guardar solo última imagen válida
+                                with open("debug_wms_update_image.png", "wb") as f:
+                                    f.write(request.content)
+
+                            except Exception as img_err:
+                                print("Imagen inválida/corrupta en update:", img_err)
+                                with open("debug_wms_update_bad_image.bin", "wb") as f:
+                                    f.write(request.content)
                         else:
-                            print("Respuesta no es imagen:")
-                            print(request.text[:300])
+                            print("Respuesta no es imagen (update)")
+                            with open("debug_wms_update_error.xml", "w", encoding="utf-8") as f:
+                                f.write(request.text[:10000])
                     else:
-                        print("Error WMS:", request.status_code)
+                        print("Error WMS update HTTP:", request.status_code)
+                        with open("debug_wms_update_http_error.txt", "w", encoding="utf-8") as f:
+                            f.write(request.text[:10000])
 
                 except Exception as e:
-                    print("Error descargando imagen:", e)
+                 print("Error descargando imagen:", e)
 
         speedColor = getSpeedColor(latestSpeed, referenceSpeed)
         speedLabel.set_text(f"Velocidad: {latestSpeed:.2f} km/h")
