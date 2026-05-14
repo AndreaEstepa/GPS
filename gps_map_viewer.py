@@ -15,11 +15,17 @@ Uso:
 import argparse
 import io
 import math
+import os
 import queue
+import struct
+import subprocess
+import tempfile
 import threading
 import time
+import wave
+import platform
 import tkinter as tk
-from tkinter import ttk, font as tkfont
+from tkinter import ttk, font as tkfont, messagebox
 
 import pynmea2
 import requests
@@ -163,9 +169,117 @@ def _speed_color(speed_kmh: float, limit: int) -> str:
     return "#f85149"       # rojo
 
 
+
+# ──────────────────────────────────────────────────────────────
+# SONIDO DE ALARMA
+# ──────────────────────────────────────────────────────────────
+
+def _build_alarm_wav() -> str:
+    """
+    Genera un fichero WAV temporal con un sonido de alarma bifrecuencia
+    usando únicamente la biblioteca estándar (wave + struct + math).
+    Devuelve la ruta al fichero temporal.
+    """
+    sample_rate = 44100
+    # Patrón: tono alto → tono bajo → pausa  (se repite en bucle)
+    pattern: list[tuple[float, float]] = [
+        (1047, 0.18),   # Do6  —  sílaba 1
+        (1319, 0.18),   # Mi6  —  sílaba 2
+        (1047, 0.18),   # Do6  —  sílaba 3
+        (   0, 0.12),   # pausa
+        (1319, 0.22),   # Mi6  —  sílaba 4 (más larga)
+        (   0, 0.20),   # pausa larga entre ciclos
+    ]
+
+
+
+    frames: list[bytes] = []
+    for freq, dur in pattern:
+        n = int(sample_rate * dur)
+        for i in range(n):
+            if freq == 0:
+                val = 0
+            else:
+                # Envolvente trapezoidal para evitar clics
+                fade_samples = min(int(sample_rate * 0.01), n // 4)
+                if i < fade_samples:
+                    env = i / fade_samples
+                elif i > n - fade_samples:
+                    env = (n - i) / fade_samples
+                else:
+                    env = 1.0
+                val = int(30000 * env * math.sin(2 * math.pi * freq * i / sample_rate))
+            frames.append(struct.pack('<h', val))
+
+    tmp = tempfile.NamedTemporaryFile(suffix='.wav', delete=False)
+    tmp_path = tmp.name
+    tmp.close()
+    with wave.open(tmp_path, 'w') as wf:
+        wf.setnchannels(1)
+        wf.setsampwidth(2)
+        wf.setframerate(sample_rate)
+        wf.writeframes(b''.join(frames))
+    return tmp_path
+
+
+def _alarm_beep_loop(stop_event: threading.Event):
+    """
+    Reproduce el sonido de alarma en bucle hasta que stop_event se active.
+    Genera el WAV una sola vez y lo reproduce con el comando nativo del SO.
+    """
+    wav_path = None
+    try:
+        wav_path = _build_alarm_wav()
+        sys_name = platform.system()
+
+        while not stop_event.is_set():
+            try:
+                if sys_name == 'Windows':
+                    import winsound
+                    winsound.PlaySound(wav_path, winsound.SND_FILENAME)
+                elif sys_name == 'Darwin':
+                    subprocess.run(['afplay', wav_path],
+                                   timeout=5, capture_output=True)
+                else:
+                    # Linux: probar reproductores en orden de preferencia
+                    _linux_play(wav_path, stop_event)
+            except Exception:
+                time.sleep(0.5)
+    finally:
+        if wav_path:
+            try:
+                os.unlink(wav_path)
+            except OSError:
+                pass
+
+
+def _linux_play(wav_path: str, stop_event: threading.Event):
+    """Intenta reproducir wav_path con el primer reproductor disponible."""
+    players = ['paplay', 'aplay', 'pw-play', 'ffplay', 'mpv', 'cvlc']
+    extra: dict[str, list[str]] = {
+        'ffplay':  ['-nodisp', '-autoexit', '-loglevel', 'quiet'],
+        'mpv':     ['--no-terminal', '--really-quiet'],
+        'cvlc':    ['--play-and-exit', '--quiet'],
+    }
+    for player in players:
+        if stop_event.is_set():
+            return
+        cmd = [player] + extra.get(player, []) + [wav_path]
+        try:
+            result = subprocess.run(cmd, timeout=6, capture_output=True)
+            if result.returncode == 0:
+                return          # reproducción correcta; volver para el siguiente ciclo
+        except FileNotFoundError:
+            continue            # reproductor no instalado
+        except subprocess.TimeoutExpired:
+            return
+    # Último recurso: campana ASCII (puede sonar o no según el terminal/DE)
+    print('\a', end='', flush=True)
+    time.sleep(0.8)
+
+
 # Ruta por defecto del fichero de mapa (mismo directorio que el script)
-import os as _os
-_DEFAULT_MAP_FILE = _os.path.join(_os.path.dirname(_os.path.abspath(__file__)),
+_DEFAULT_MAP_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)),
                                   "Mapa_INSIA2.txt")
 
 # ──────────────────────────────────────────────────────────────
@@ -183,10 +297,10 @@ WMS_URL           = "https://www.ign.es/wms-inspire/pnoa-ma"
 # El tile descargado es FETCH_MULTIPLIER veces más grande que el
 # área visible.  Mientras llega el siguiente tile, la imagen se
 # desplaza sin tirones usando el tile en caché.
-FETCH_MULTIPLIER  = 2.5    # factor de sobredimensionado (ancho y alto)
+FETCH_MULTIPLIER  = 2.0    # factor de sobredimensionado (ancho y alto)
 REPETCH_FRACTION  = 0.55   # re-descargar cuando la posición supere el
                             # 55 % del margen extra del tile en caché
-PAN_INTERVAL_MS   = 50     # cada cuántos ms se re-renderiza el recorte
+PAN_INTERVAL_MS   = 80     # cada cuántos ms se re-renderiza el recorte (~12 fps)
 
 CARDINALS = ["N", "NNE", "NE", "ENE", "E", "ESE", "SE", "SSE",
              "S", "SSO", "SO", "OSO", "O", "ONO", "NO", "NNO"]
@@ -545,6 +659,365 @@ class SpeedSignWidget(tk.Canvas):
                              font=("Courier", 7))
 
 
+
+# ──────────────────────────────────────────────────────────────
+# DIÁLOGO DE CONFIGURACIÓN DE ALARMA
+# ──────────────────────────────────────────────────────────────
+
+class AlarmSetupDialog:
+    """
+    Modal con mapa interactivo para configurar la alarma de zona:
+      · Arrastra para mover el mapa
+      · Rueda del ratón para zoom
+      · Clic para colocar / mover el centro de la alarma
+    Tras confirmar, self.result = (lat, lon, radius_m) o None si cancela.
+    """
+    DISP_W      = 660
+    DISP_H      = int(660 * MAP_HEIGHT / MAP_WIDTH)
+    MARGIN_MIN  = 0.0003   # ~33 m semiancho → máximo zoom
+    MARGIN_MAX  = 0.06     # ~6.6 km semiancho → mínimo zoom
+    ZOOM_FACTOR = 1.5      # factor por paso de rueda
+
+    def __init__(self, parent, pil_image: 'Image.Image', render_pos):
+        self.result     = None
+        self._selected  = None   # (lat, lon) del pin de alarma
+
+        # ── Vista actual del mapa en el diálogo ────────────────
+        self._view_lat    = render_pos[0]
+        self._view_lon    = render_pos[1]
+        self._view_margin = MARGIN_DEG   # mismo zoom inicial que el mapa principal
+
+        # ── Tile en caché (arranca con la captura actual) ──────
+        self._tile_pil    = pil_image.convert("RGB").resize(
+            (self.DISP_W, self.DISP_H), Image.LANCZOS)
+        self._tile_lat    = render_pos[0]
+        self._tile_lon    = render_pos[1]
+        self._tile_margin = MARGIN_DEG
+        self._fetch_gen   = 0
+        self._loading     = False
+
+        # ── Estado de arrastre ─────────────────────────────────
+        self._press_x   = 0
+        self._press_y   = 0
+        self._press_lat = render_pos[0]
+        self._press_lon = render_pos[1]
+        self._is_drag   = False
+
+        # ── Ventana ────────────────────────────────────────────
+        self.top = tk.Toplevel(parent)
+        self.top.title("Configurar alarma de zona")
+        self.top.configure(bg="#0d1117")
+        self.top.resizable(False, False)
+        self.top.transient(parent)
+        self.top.grab_set()
+        self.top.protocol("WM_DELETE_WINDOW", self.top.destroy)
+
+        # ── Instrucciones ──────────────────────────────────────
+        tk.Label(self.top,
+                 text="Arrastra para mover  ·  Rueda del ratón para zoom  ·  Clic para colocar la alarma",
+                 font=("Courier", 9), bg="#0d1117", fg="#8b949e").pack(pady=(10, 2))
+
+        # ── Canvas ─────────────────────────────────────────────
+        self._canvas = tk.Canvas(self.top,
+                                 width=self.DISP_W, height=self.DISP_H,
+                                 bg="#161b22", highlightthickness=1,
+                                 highlightbackground="#30363d",
+                                 cursor="crosshair")
+        self._canvas.pack(padx=12, pady=(0, 8))
+        self._canvas.bind("<ButtonPress-1>",  self._on_press)
+        self._canvas.bind("<B1-Motion>",       self._on_drag)
+        self._canvas.bind("<ButtonRelease-1>", self._on_release)
+        self._canvas.bind("<MouseWheel>",      self._on_wheel)   # Windows/macOS
+        self._canvas.bind("<Button-4>",        self._on_wheel)   # Linux ↑
+        self._canvas.bind("<Button-5>",        self._on_wheel)   # Linux ↓
+        self._tk_img = None
+
+        # ── Control de radio ───────────────────────────────────
+        rf = tk.Frame(self.top, bg="#0d1117")
+        rf.pack(fill="x", padx=16, pady=(0, 8))
+        tk.Label(rf, text="Radio de alarma:", font=("Courier", 10),
+                 bg="#0d1117", fg="#e6edf3").pack(side="left")
+        self._radius_var = tk.IntVar(value=200)
+        tk.Scale(rf, from_=50, to=5000, orient="horizontal",
+                 variable=self._radius_var, resolution=50, length=380,
+                 bg="#0d1117", fg="#e6edf3", highlightthickness=0,
+                 troughcolor="#21262d", activebackground="#dc3232",
+                 command=lambda _: self._redraw()
+                 ).pack(side="left", padx=(10, 0))
+        self._lbl_r = tk.Label(rf, text="200 m", width=8,
+                               font=("Courier", 10, "bold"),
+                               bg="#0d1117", fg="#ffd700")
+        self._lbl_r.pack(side="left", padx=(8, 0))
+
+        # ── Botones ────────────────────────────────────────────
+        bf = tk.Frame(self.top, bg="#0d1117")
+        bf.pack(pady=(0, 14))
+        self._btn_ok = tk.Button(bf, text="\U0001f514  Establecer alarma",
+                                  font=("Courier", 11, "bold"),
+                                  bg="#1f6feb", fg="white",
+                                  activebackground="#388bfd",
+                                  relief="flat", padx=18, pady=7,
+                                  state="disabled", command=self._confirm)
+        self._btn_ok.pack(side="left", padx=(0, 14))
+        tk.Button(bf, text="\u2715  Cancelar",
+                  font=("Courier", 11), bg="#21262d", fg="#e6edf3",
+                  activebackground="#30363d", relief="flat",
+                  padx=18, pady=7,
+                  command=self.top.destroy).pack(side="left")
+
+        # Render inicial (todos los widgets ya existen)
+        self._wheel_after = None
+        self._redraw(Image.LANCZOS)
+
+    # ── PPD del diálogo ────────────────────────────────────────
+
+    @property
+    def _ppd(self) -> float:
+        """Píxeles por grado en la vista actual del diálogo."""
+        return self.DISP_H / (2.0 * self._view_margin)
+
+    # ── Conversiones ──────────────────────────────────────────
+
+    def _px_to_latlon(self, px: float, py: float):
+        """Convierte píxel del canvas → (lat, lon)."""
+        dlat = -(py - self.DISP_H / 2.0) / self._ppd
+        dlon =  (px - self.DISP_W / 2.0) / self._ppd
+        return self._view_lat + dlat, self._view_lon + dlon
+
+    def _latlon_to_px(self, lat: float, lon: float):
+        """Convierte (lat, lon) → píxel del canvas."""
+        ppd = self._ppd
+        px  = self.DISP_W / 2.0 + (lon - self._view_lon) * ppd
+        py  = self.DISP_H / 2.0 - (lat - self._view_lat) * ppd
+        return px, py
+
+    # ── Eventos del canvas ─────────────────────────────────────
+
+    def _on_press(self, event):
+        self._press_x   = event.x
+        self._press_y   = event.y
+        self._press_lat = self._view_lat
+        self._press_lon = self._view_lon
+        self._is_drag   = False
+        self._canvas.configure(cursor="fleur")
+
+    def _on_drag(self, event):
+        dx = event.x - self._press_x
+        dy = event.y - self._press_y
+        if abs(dx) > 4 or abs(dy) > 4:
+            self._is_drag = True
+        if not self._is_drag:
+            return
+        ppd = self._ppd
+        self._view_lat = self._press_lat + dy / ppd
+        self._view_lon = self._press_lon - dx / ppd
+        self._redraw(Image.NEAREST)   # rápido durante el arrastre
+
+    def _on_release(self, event):
+        self._canvas.configure(cursor="crosshair")
+        if not self._is_drag:
+            lat, lon = self._px_to_latlon(event.x, event.y)
+            self._selected = (lat, lon)
+            self._btn_ok.configure(state="normal")
+            self._redraw(Image.LANCZOS)
+        else:
+            self._redraw(Image.LANCZOS)   # calidad al soltar
+            self._fetch_tile()
+
+    def _on_wheel(self, event):
+        """Zoom con la rueda del ratón. Descarga tile solo 300 ms después del último paso."""
+        zoom_in = (event.num == 4) or (getattr(event, 'delta', 0) > 0)
+        if zoom_in:
+            self._view_margin = max(self.MARGIN_MIN,
+                                    self._view_margin / self.ZOOM_FACTOR)
+        else:
+            self._view_margin = min(self.MARGIN_MAX,
+                                    self._view_margin * self.ZOOM_FACTOR)
+        self._redraw(Image.NEAREST)           # preview inmediato
+        # Cancelar descarga pendiente y reprogramar con debounce
+        if hasattr(self, '_wheel_after') and self._wheel_after is not None:
+            try:
+                self.top.after_cancel(self._wheel_after)
+            except Exception:
+                pass
+        self._wheel_after = self.top.after(300, self._fetch_tile)
+
+    # ── Renderizado ────────────────────────────────────────────
+
+    def _redraw(self, quality=Image.NEAREST):
+        """
+        Renderiza la vista actual reutilizando el tile en caché.
+        Durante el arrastre usa NEAREST (rápido); al soltar se llama
+        con LANCZOS para calidad final.
+        """
+        ppd_tile = self.DISP_H / (2.0 * self._tile_margin)
+        ppd_view = self._ppd
+        scale    = ppd_view / ppd_tile
+
+        new_w = max(1, int(self.DISP_W * scale))
+        new_h = max(1, int(self.DISP_H * scale))
+        scaled = self._tile_pil.resize((new_w, new_h), quality)
+
+        ppd = self._ppd
+        tile_cx = self.DISP_W / 2.0 + (self._tile_lon - self._view_lon) * ppd
+        tile_cy = self.DISP_H / 2.0 - (self._tile_lat - self._view_lat) * ppd
+        tl_x = int(round(tile_cx - new_w / 2.0))
+        tl_y = int(round(tile_cy - new_h / 2.0))
+
+        base = Image.new("RGB", (self.DISP_W, self.DISP_H), (22, 27, 34))
+        base.paste(scaled, (tl_x, tl_y))
+        self._draw_overlay(base)
+
+    def _draw_overlay(self, base: 'Image.Image'):
+        """Dibuja pin + círculo sobre la imagen base y la pone en el canvas.
+        Toda la composición PIL ocurre aquí; ImageTk se crea al final."""
+        r_m = self._radius_var.get()
+        self._lbl_r.configure(text=f"{r_m} m")
+
+        img = base.convert("RGBA")
+
+        if self._selected is not None:
+            cx, cy = self._latlon_to_px(*self._selected)
+            r_px   = (r_m / 111_000.0) * self._ppd
+
+            # Relleno semitransparente
+            ov = Image.new("RGBA", img.size, (0, 0, 0, 0))
+            od = ImageDraw.Draw(ov)
+            od.ellipse([cx - r_px, cy - r_px, cx + r_px, cy + r_px],
+                       fill=(255, 120, 0, 55))
+            img = Image.alpha_composite(img, ov)
+
+            # Borde + retícula central
+            draw = ImageDraw.Draw(img)
+            draw.ellipse([cx - r_px, cy - r_px, cx + r_px, cy + r_px],
+                         outline=(255, 120, 0, 255), width=3)
+            draw.ellipse([cx - 7, cy - 7, cx + 7, cy + 7],
+                         fill=(255, 120, 0, 255), outline=(255, 255, 255, 220), width=2)
+            draw.line([cx - 20, cy, cx + 20, cy], fill=(255, 255, 255, 220), width=2)
+            draw.line([cx, cy - 20, cx, cy + 20], fill=(255, 255, 255, 220), width=2)
+
+        self._tk_img = ImageTk.PhotoImage(img.convert("RGB"))
+        self._canvas.create_image(0, 0, anchor="nw", image=self._tk_img)
+
+        # Indicador de carga
+        if self._loading:
+            self._canvas.create_rectangle(
+                self.DISP_W // 2 - 120, self.DISP_H // 2 - 18,
+                self.DISP_W // 2 + 120, self.DISP_H // 2 + 18,
+                fill="#0d1117", outline="#30363d")
+            self._canvas.create_text(
+                self.DISP_W // 2, self.DISP_H // 2,
+                text="\u27f3  Cargando mapa\u2026", fill="#8b949e",
+                font=("Courier", 12))
+
+        # Coordenadas en la esquina inferior izquierda
+        if self._selected is not None:
+            slat, slon = self._selected
+            coord_txt = f"Alarma: {slat:.5f}\u00b0  {slon:.5f}\u00b0"
+            self._canvas.create_text(8, self.DISP_H - 8, anchor="sw",
+                                     text=coord_txt, fill="#ffd700",
+                                     font=("Courier", 8))
+
+    # ── Descarga de tile ───────────────────────────────────────
+
+    def _fetch_tile(self):
+        """Solicita un nuevo tile centrado en _view_lat/_view_lon/_view_margin."""
+        self._fetch_gen += 1
+        gen    = self._fetch_gen
+        lat    = self._view_lat
+        lon    = self._view_lon
+        margin = self._view_margin
+        self._loading = True
+        self._redraw()
+
+        def _worker():
+            img = fetch_map(lat, lon, margin=margin,
+                            width=self.DISP_W, height=self.DISP_H, mult=1.0)
+            try:
+                self.top.after(0, lambda: self._apply_tile(img, gen, lat, lon, margin))
+            except tk.TclError:
+                pass  # diálogo cerrado antes de recibir la respuesta
+
+        threading.Thread(target=_worker, daemon=True).start()
+
+    def _apply_tile(self, img, gen: int,
+                    lat: float, lon: float, margin: float):
+        if gen != self._fetch_gen:
+            return
+        self._loading = False
+        if img is not None:
+            self._tile_pil    = img.convert("RGB")
+            self._tile_lat    = lat
+            self._tile_lon    = lon
+            self._tile_margin = margin
+        self._redraw(Image.LANCZOS)
+
+    # ── Confirmar ──────────────────────────────────────────────
+
+    def _confirm(self):
+        if self._selected is None:
+            return
+        lat, lon = self._selected
+        self.result = (lat, lon, self._radius_var.get())
+        self.top.destroy()
+
+
+# ──────────────────────────────────────────────────────────────
+# CONSTRUCCIÓN DE FRAME (ejecutable en hilo secundario)
+# ──────────────────────────────────────────────────────────────
+
+def _build_frame(tile_image, tile_center, render_pos, alarm, heading_deg):
+    """
+    Recorta el tile, dibuja la alarma y el marcador GPS.
+    Devuelve (pil_crop_sin_marcador, ImageTk.PhotoImage) o None si falla.
+    Diseñada para ejecutarse fuera del hilo de Tkinter.
+    """
+    try:
+        lat, lon       = render_pos
+        tlat, tlon     = tile_center
+        tile_w, tile_h = tile_image.size
+
+        ppd_lat = tile_h / (2.0 * MARGIN_DEG * FETCH_MULTIPLIER)
+        ppd_lon = tile_w / (2.0 * MARGIN_DEG * (MAP_WIDTH / MAP_HEIGHT) * FETCH_MULTIPLIER)
+
+        cx = tile_w / 2.0 + (lon - tlon) * ppd_lon
+        cy = tile_h / 2.0 - (lat - tlat) * ppd_lat
+
+        half_w, half_h = MAP_WIDTH / 2, MAP_HEIGHT / 2
+        left = int(max(0, min(cx - half_w, tile_w - MAP_WIDTH)))
+        top  = int(max(0, min(cy - half_h, tile_h - MAP_HEIGHT)))
+        crop = tile_image.crop((left, top, left + MAP_WIDTH, top + MAP_HEIGHT))
+
+        # Círculo de alarma
+        if alarm is not None:
+            alat, alon = alarm['lat'], alarm['lon']
+            r_m        = alarm['radius_m']
+            ax_view    = tile_w / 2.0 + (alon - tlon) * ppd_lon - left
+            ay_view    = tile_h / 2.0 - (alat - tlat) * ppd_lat - top
+            r_px       = (r_m / 111_000.0) * ppd_lat
+            overlay    = Image.new('RGBA', crop.size, (0, 0, 0, 0))
+            od         = ImageDraw.Draw(overlay)
+            od.ellipse([ax_view - r_px, ay_view - r_px,
+                        ax_view + r_px, ay_view + r_px],
+                       fill=(255, 120, 0, 45))
+            crop = Image.alpha_composite(crop.convert('RGBA'), overlay)
+            ad   = ImageDraw.Draw(crop)
+            ad.ellipse([ax_view - r_px, ay_view - r_px,
+                        ax_view + r_px, ay_view + r_px],
+                       outline=(255, 120, 0, 230), width=3)
+            ad.ellipse([ax_view - 6, ay_view - 6,
+                        ax_view + 6, ay_view + 6],
+                       fill=(255, 120, 0, 255), outline=(255, 255, 255, 200), width=2)
+
+        pil_crop = crop.copy()                          # para el diálogo de alarma
+        crop_marked = draw_marker(crop, heading_deg=heading_deg)
+        tk_photo = ImageTk.PhotoImage(crop_marked.convert("RGB"))
+        return pil_crop, tk_photo
+    except Exception as e:
+        print(f"[render] Error: {e}")
+        return None
+
+
 # ──────────────────────────────────────────────────────────────
 # APLICACIÓN PRINCIPAL
 # ──────────────────────────────────────────────────────────────
@@ -581,8 +1054,15 @@ class GPSMapApp:
         self._speed_zones = _load_speed_zones(getattr(args, 'map', _DEFAULT_MAP_FILE))
 
         # Scroll suave: tile en caché sobredimensionado
-        self._tile_image   = None   # PIL Image grande (FETCH_MULTIPLIER × visible)
-        self._tile_center  = None   # (lat, lon) del centro del tile en caché
+        self._tile_image      = None   # PIL Image grande (FETCH_MULTIPLIER × visible)
+        self._tile_center     = None   # (lat, lon) del centro del tile en caché
+        self._last_render_pil = None   # última vista PIL para el diálogo de alarma
+        self._rendering       = False  # True mientras un hilo de render está activo
+
+        # Alarma de zona
+        self._alarm           = None   # dict {lat, lon, radius_m} o None
+        self._alarm_firing    = False  # True mientras el popup está activo
+        self._alarm_sound_stop= None   # Event para detener el hilo de sonido
 
         self._build_ui()
         self._start_gps()
@@ -601,6 +1081,10 @@ class GPSMapApp:
         tk.Label(header, text="◉ GPS MAP VIEWER",
                  font=tkfont.Font(family="Courier", size=15, weight="bold"),
                  bg=BG, fg=ACC).pack(side="left")
+        tk.Button(header, text="🔔  Alarma",
+                  font=("Courier", 10), bg="#21262d", fg="#e6edf3",
+                  activebackground="#30363d", relief="flat", cursor="hand2",
+                  command=self._open_alarm_dialog).pack(side="left", padx=(14, 0))
         self.lbl_coords = tk.Label(header, text="Esperando señal GPS…",
                                    font=("Courier", 10), bg=BG, fg="#8b949e")
         self.lbl_coords.pack(side="right")
@@ -709,6 +1193,7 @@ class GPSMapApp:
         if self._tile_image is not None and self._current_pos is not None:
             self._advance_render_pos()
             self._render_current_view()
+            self._check_alarm()
         self.root.after(PAN_INTERVAL_MS, self._pan_tick)
 
     def _advance_render_pos(self):
@@ -858,29 +1343,39 @@ class GPSMapApp:
             text=f"✔ Actualizado {time.strftime('%H:%M:%S')}")
 
     def _render_current_view(self):
-        # Recorta el tile grande centrado en la posicion interpolada y lo muestra.
+        """
+        Lanza el trabajo pesado de PIL en un hilo secundario para no bloquear
+        el event-loop de Tkinter. Si ya hay un render en curso lo descarta
+        (solo importa el frame más reciente).
+        """
         if self._tile_image is None or self._render_pos is None:
             return
-        lat, lon     = self._render_pos
-        tlat, tlon   = self._tile_center
-        tile_w, tile_h = self._tile_image.size
+        if getattr(self, '_rendering', False):
+            return                        # frame anterior aún en curso → saltamos
+        self._rendering = True
 
-        # Pixeles por grado para el tile descargado
-        ppd_lat = tile_h / (2.0 * MARGIN_DEG * FETCH_MULTIPLIER)
-        ppd_lon = tile_w / (2.0 * MARGIN_DEG * (MAP_WIDTH / MAP_HEIGHT) * FETCH_MULTIPLIER)
+        # Capturar estado inmutable para el hilo
+        tile_snap   = self._tile_image    # PIL Image (inmutable tras _apply_image)
+        tile_center = self._tile_center
+        render_pos  = self._render_pos
+        alarm       = self._alarm
+        heading     = self._heading_deg
 
-        # Centro del tile en pixeles + desplazamiento de la posicion actual
-        cx = tile_w / 2.0 + (lon - tlon) * ppd_lon
-        cy = tile_h / 2.0 - (lat - tlat) * ppd_lat  # lat sube = y baja
+        def _worker():
+            frame = _build_frame(tile_snap, tile_center, render_pos,
+                                 alarm, heading)
+            self.root.after(0, self._apply_frame, frame, render_pos)
 
-        # Recuadro de recorte (viewport MAP_WIDTH x MAP_HEIGHT)
-        half_w, half_h = MAP_WIDTH / 2, MAP_HEIGHT / 2
-        left   = int(max(0, min(cx - half_w, tile_w - MAP_WIDTH)))
-        top    = int(max(0, min(cy - half_h, tile_h - MAP_HEIGHT)))
-        crop   = self._tile_image.crop((left, top, left + MAP_WIDTH, top + MAP_HEIGHT))
+        threading.Thread(target=_worker, daemon=True).start()
 
-        crop = draw_marker(crop, heading_deg=self._heading_deg)
-        self._tk_image = ImageTk.PhotoImage(crop.convert("RGB"))
+    def _apply_frame(self, frame_data, render_pos):
+        """Recibe (pil_crop_sin_marcador, tk_photo) desde el hilo y actualiza el canvas."""
+        self._rendering = False
+        if frame_data is None:
+            return
+        pil_crop, tk_photo = frame_data
+        self._last_render_pil = pil_crop
+        self._tk_image        = tk_photo
         self.canvas.delete("all")
         self.canvas.create_image(0, 0, anchor="nw", image=self._tk_image)
         self._draw_scale()
@@ -897,10 +1392,9 @@ class GPSMapApp:
 
     def _draw_speed_overlay(self):
         """
-        Overlay en la esquina superior derecha del mapa:
-          - Señal de velocidad estilo tráfico (círculo rojo/blanco) con el límite
-          - Velocidad actual coloreada debajo
-          - Rumbo
+        Overlay en la esquina superior derecha del mapa.
+        Usa canvas items con tags fijos y solo los recrea cuando cambian los datos,
+        evitando recrear todos los items en cada frame.
         """
         limit     = self._current_limit
         spd_color = _speed_color(self._speed_kmh, limit) if limit is not None else "#e6edf3"
@@ -914,33 +1408,27 @@ class GPSMapApp:
                                      stipple="gray50")
 
         # ── Señal circular ─────────────────────────────────────
-        sign_r = 36          # radio exterior de la señal
+        sign_r = 36
         cx     = bx + box_w // 2
         cy     = by + 10 + sign_r
 
-        # sombra
         self.canvas.create_oval(cx - sign_r + 2, cy - sign_r + 2,
                                 cx + sign_r + 2, cy + sign_r + 2,
                                 fill="#000000", outline="")
         if limit is not None:
-            # aro rojo
             self.canvas.create_oval(cx - sign_r, cy - sign_r,
                                     cx + sign_r, cy + sign_r,
                                     fill="#cc2200", outline="#881100", width=1)
-            # relleno blanco
             inner_r = sign_r - 7
             self.canvas.create_oval(cx - inner_r, cy - inner_r,
                                     cx + inner_r, cy + inner_r,
                                     fill="#f5f5f5", outline="")
-            # número
             digits    = len(str(limit))
             font_size = 20 if digits <= 2 else 16
-            self.canvas.create_text(cx, cy,
-                                    text=str(limit),
+            self.canvas.create_text(cx, cy, text=str(limit),
                                     fill="#111111",
                                     font=("Arial", font_size, "bold"))
         else:
-            # sin zona — círculo gris
             self.canvas.create_oval(cx - sign_r, cy - sign_r,
                                     cx + sign_r, cy + sign_r,
                                     fill="#1e2730", outline="#30363d", width=2)
@@ -959,6 +1447,115 @@ class GPSMapApp:
             self.canvas.create_text(cx, spd_y + 18,
                                     text=f"{self._heading_deg:.0f}° {cardinal}",
                                     fill="#ffd700", font=("Courier", 10))
+
+
+    # ── Alarma de zona ──────────────────────────────────────
+
+    def _open_alarm_dialog(self):
+        """Abre el modal de configuración de alarma."""
+        if self._last_render_pil is None or self._render_pos is None:
+            messagebox.showinfo("Sin mapa",
+                                "Espera a que se descargue el primer mapa.",
+                                parent=self.root)
+            return
+        # Si hay alarma activa, preguntar si desea reemplazarla
+        if self._alarm is not None:
+            if not messagebox.askyesno("Alarma activa",
+                                        "Ya hay una alarma activa.\n¿Deseas reemplazarla?",
+                                        parent=self.root):
+                return
+            # Cancelar alarma anterior
+            self._alarm = None
+            self._alarm_firing = False
+            if self._alarm_sound_stop:
+                self._alarm_sound_stop.set()
+
+        dlg = AlarmSetupDialog(self.root, self._last_render_pil, self._render_pos)
+        self.root.wait_window(dlg.top)
+        if dlg.result is not None:
+            lat, lon, radius_m = dlg.result
+            self._alarm         = {'lat': lat, 'lon': lon, 'radius_m': radius_m}
+            self._alarm_firing  = False
+
+    def _check_alarm(self):
+        """Comprueba si la posición GPS está dentro del círculo de alarma."""
+        if self._alarm is None or self._alarm_firing:
+            return
+        if self._render_pos is None:
+            return
+        lat, lon = self._render_pos
+        alat     = self._alarm['lat']
+        alon     = self._alarm['lon']
+        dist_m   = haversine_km(lat, lon, alat, alon) * 1000.0
+        if dist_m <= self._alarm['radius_m']:
+            self._trigger_alarm()
+
+    def _trigger_alarm(self):
+        """Arranca el sonido y muestra el popup de alarma."""
+        self._alarm_firing    = True
+        stop_ev               = threading.Event()
+        self._alarm_sound_stop = stop_ev
+        threading.Thread(target=_alarm_beep_loop, args=(stop_ev,),
+                         daemon=True).start()
+        self._show_alarm_popup()
+
+    def _show_alarm_popup(self):
+        """Muestra un Toplevel de aviso mientras suena la alarma."""
+        popup = tk.Toplevel(self.root)
+        popup.title("¡ALARMA!")
+        popup.configure(bg="#0d1117")
+        popup.resizable(False, False)
+        popup.transient(self.root)
+        popup.grab_set()
+        # No permitir cerrarlo con la X sin pasar por Aceptar
+        popup.protocol("WM_DELETE_WINDOW", lambda: None)
+
+        # Centrar sobre la ventana principal
+        self.root.update_idletasks()
+        rx = self.root.winfo_x() + self.root.winfo_width()  // 2
+        ry = self.root.winfo_y() + self.root.winfo_height() // 2
+        pw, ph = 380, 210
+        popup.geometry(f"{pw}x{ph}+{rx - pw//2}+{ry - ph//2}")
+
+        # Icono de advertencia animado (parpadeo de color)
+        lbl_icon = tk.Label(popup, text="⚠", font=("Courier", 36),
+                            bg="#0d1117", fg="#f85149")
+        lbl_icon.pack(pady=(22, 0))
+
+        tk.Label(popup,
+                 text="¡Has entrado en el área!",
+                 font=("Courier", 15, "bold"),
+                 bg="#0d1117", fg="#f85149").pack(pady=(6, 18))
+
+        tk.Button(popup, text="  ✔  Aceptar  ",
+                  font=("Courier", 12, "bold"),
+                  bg="#dc3232", fg="white",
+                  activebackground="#f85149",
+                  relief="flat", padx=20, pady=8,
+                  command=lambda: self._dismiss_alarm(popup)).pack()
+
+        # Animación de parpadeo del icono
+        self._blink_popup(lbl_icon, True, popup)
+
+    def _blink_popup(self, label, state: bool, popup):
+        """Alterna el color del icono ⚠ mientras el popup está abierto."""
+        try:
+            label.configure(fg="#f85149" if state else "#661100")
+            popup.after(400, self._blink_popup, label, not state, popup)
+        except tk.TclError:
+            pass  # popup ya destruido
+
+    def _dismiss_alarm(self, popup):
+        """Detiene el sonido, elimina la alarma y cierra el popup."""
+        if self._alarm_sound_stop:
+            self._alarm_sound_stop.set()
+            self._alarm_sound_stop = None
+        self._alarm        = None
+        self._alarm_firing = False
+        try:
+            popup.destroy()
+        except tk.TclError:
+            pass
 
     # ── Cierre ───────────────────────────────────────────────
 
