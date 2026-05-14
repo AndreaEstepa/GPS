@@ -65,13 +65,20 @@ def _utm_to_latlon(easting: float, northing: float):
     return math.degrees(lat), math.degrees(lon)
 
 
+# Pares de velocidades solapadas y qué límite corresponde a cada dirección.
+# Formato: (spd_sw, spd_ne)  — SW: rumbo 135-315°, NE: el resto
+_OVERLAP_PAIRS = [
+    (20, 18),   # 20 km/h hacia SW, 18 km/h hacia NE
+    (10,  5),   # 10 km/h hacia SW,  5 km/h hacia NE
+]
+
+
 def _load_speed_zones(filepath: str):
     """
-    Lee el fichero de mapa y devuelve una lista de dicts con:
-      { 'lat': float, 'lon': float, 'speed': int,
-        'overlap': bool }   ← True si el punto pertenece a la zona solapada 10/5
-    La zona solapada se determina por el bounding-box de intersección entre
-    los segmentos de 10 km/h y 5 km/h.
+    Lee el fichero de mapa y devuelve una lista de dicts:
+      { 'lat', 'lon', 'speed', 'overlap_pair' }
+    'overlap_pair' es None si el punto no está en zona solapada, o la tupla
+    (spd_sw, spd_ne) del par al que pertenece.
     """
     import math
     raw = []
@@ -83,25 +90,28 @@ def _load_speed_zones(filepath: str):
                     north, east, spd = float(parts[0]), float(parts[1]), int(parts[2])
                     lat, lon = _utm_to_latlon(east, north)
                     raw.append({'lat': lat, 'lon': lon, 'speed': spd,
-                                'north': north, 'east': east})
+                                'north': north, 'east': east,
+                                'overlap_pair': None})
     except FileNotFoundError:
         return []
 
-    # Bounding boxes de los segmentos de 10 y 5 km/h (coordenadas UTM)
-    pts10 = [p for p in raw if p['speed'] == 10]
-    pts5  = [p for p in raw if p['speed'] == 5]
-    if pts10 and pts5:
-        ov_n_min = max(min(p['north'] for p in pts10), min(p['north'] for p in pts5))
-        ov_n_max = min(max(p['north'] for p in pts10), max(p['north'] for p in pts5))
-        ov_e_min = max(min(p['east']  for p in pts10), min(p['east']  for p in pts5))
-        ov_e_max = min(max(p['east']  for p in pts10), max(p['east']  for p in pts5))
+    # Detectar zonas solapadas para cada par definido en _OVERLAP_PAIRS
+    for spd_sw, spd_ne in _OVERLAP_PAIRS:
+        pts_a = [p for p in raw if p['speed'] == spd_sw]
+        pts_b = [p for p in raw if p['speed'] == spd_ne]
+        if not pts_a or not pts_b:
+            continue
+        ov_n_min = max(min(p['north'] for p in pts_a), min(p['north'] for p in pts_b))
+        ov_n_max = min(max(p['north'] for p in pts_a), max(p['north'] for p in pts_b))
+        ov_e_min = max(min(p['east']  for p in pts_a), min(p['east']  for p in pts_b))
+        ov_e_max = min(max(p['east']  for p in pts_a), max(p['east']  for p in pts_b))
+        if ov_n_max < ov_n_min or ov_e_max < ov_e_min:
+            continue   # sin intersección real
         for p in raw:
-            p['overlap'] = (p['speed'] in (5, 10)
-                            and ov_n_min <= p['north'] <= ov_n_max
-                            and ov_e_min <= p['east']  <= ov_e_max)
-    else:
-        for p in raw:
-            p['overlap'] = False
+            if (p['speed'] in (spd_sw, spd_ne)
+                    and ov_n_min <= p['north'] <= ov_n_max
+                    and ov_e_min <= p['east']  <= ov_e_max):
+                p['overlap_pair'] = (spd_sw, spd_ne)
 
     # Eliminar campos auxiliares UTM
     for p in raw:
@@ -110,18 +120,22 @@ def _load_speed_zones(filepath: str):
 
 
 def _find_speed_limit(lat: float, lon: float, heading_deg,
-                       zones: list, search_radius_m: float = 25.0) -> int | None:
+                       zones: list, search_radius_m: float = 25.0):
     """
     Devuelve el límite de velocidad del punto más cercano dentro de
-    search_radius_m.  En la zona solapada (10/5 km/h) aplica la regla de
-    sentido de circulación:
-      - Hacia el SW (135°–315°) → 10 km/h
-      - Hacia el NE   (0°–135° ó 315°–360°) → 5 km/h
+    search_radius_m, o None si no hay ninguno.
+
+    En zonas solapadas aplica la regla de sentido de circulación:
+      - Hacia el SW (135°–315°) → velocidad del par con índice 0 (spd_sw)
+      - Hacia el NE  (resto)    → velocidad del par con índice 1 (spd_ne)
+
+    Pares solapados definidos en _OVERLAP_PAIRS:
+      (20, 18): 20 km/h SW / 18 km/h NE
+      (10,  5): 10 km/h SW /  5 km/h NE
     """
     import math
     best_d, best_zone = float('inf'), None
     for z in zones:
-        # Distancia aproximada en metros
         dlat = (z['lat'] - lat) * 111_000
         dlon = (z['lon'] - lon) * 111_000 * math.cos(math.radians(lat))
         d = math.hypot(dlat, dlon)
@@ -129,11 +143,11 @@ def _find_speed_limit(lat: float, lon: float, heading_deg,
             best_d, best_zone = d, z
     if best_d > search_radius_m or best_zone is None:
         return None
-    if best_zone.get('overlap') and heading_deg is not None:
+    pair = best_zone.get('overlap_pair')
+    if pair is not None and heading_deg is not None:
+        spd_sw, spd_ne = pair
         h = heading_deg % 360
-        # SW: 135° – 315°  → speed 10
-        # NE: fuera de ese rango → speed 5
-        return 10 if 135 <= h <= 315 else 5
+        return spd_sw if 135 <= h <= 315 else spd_ne
     return best_zone['speed']
 
 
@@ -245,7 +259,7 @@ def gps_thread(port, baud, pos_queue, stop_event, status_queue):
 
 
 def demo_thread(pos_queue, stop_event, status_queue):
-    """Simula movimiento circular sobre Madrid."""
+    """Simula movimiento circular sobre Madrid (demo original)."""
     lat0, lon0 = 40.4168, -3.7038
     t = 0.0
     status_queue.put("● Modo DEMO activo — sin puerto serie real")
@@ -256,6 +270,88 @@ def demo_thread(pos_queue, stop_event, status_queue):
         status_queue.put(f"DEMO  {lat:.6f}°N  {lon:.6f}°E")
         t += 0.01
         time.sleep(0.05)
+
+
+def map_demo_thread(pos_queue, stop_event, status_queue, map_file, speed_kmh=15.0):
+    """
+    Recorre los puntos de Mapa_INSIA2.txt interpolando posicion a la velocidad
+    indicada (km/h).  Al llegar al ultimo punto invierte el sentido (ping-pong).
+
+    La velocidad simulada varia en tres tramos del ciclo completo para ejercitar
+    los tres estados de color del indicador:
+      - tramo inicial  (~33 %) -> speed_kmh * 0.80  (verde,   <90 %)
+      - tramo central  (~33 %) -> speed_kmh * 1.00  (amarillo, ~100 %)
+      - tramo final    (~33 %) -> speed_kmh * 1.20  (rojo,    >110 %)
+    """
+    raw_zones = _load_speed_zones(map_file)
+    if not raw_zones:
+        status_queue.put("? Demo mapa: fichero no encontrado")
+        return
+
+    waypoints = [(z['lat'], z['lon']) for z in raw_zones]
+    n = len(waypoints)
+    status_queue.put(f"? Demo MAPA activo -- {n} puntos cargados")
+
+    idx       = 0
+    direction = 1
+    seg_frac  = 0.0
+    cycle_pos = 0.0
+
+    UPDATE_HZ = 20
+    dt_s      = 1.0 / UPDATE_HZ
+
+    while not stop_event.is_set():
+        i_next = max(0, min(n - 1, idx + direction))
+        lat_a, lon_a = waypoints[idx]
+        lat_b, lon_b = waypoints[i_next]
+
+        dlat      = (lat_b - lat_a) * 111_000
+        dlon      = (lon_b - lon_a) * 111_000 * math.cos(math.radians(lat_a))
+        seg_len_m = math.hypot(dlat, dlon)
+
+        t3 = cycle_pos % 1.0
+        if t3 < 0.333:
+            sim_speed = speed_kmh * 0.80
+        elif t3 < 0.667:
+            sim_speed = speed_kmh * 1.00
+        else:
+            sim_speed = speed_kmh * 1.20
+
+        advance_m = (sim_speed / 3.6) * dt_s
+
+        if seg_len_m > 0.1:
+            seg_frac += advance_m / seg_len_m
+        else:
+            seg_frac = 1.0
+
+        while seg_frac >= 1.0:
+            seg_frac -= 1.0
+            idx += direction
+            if idx >= n - 1:
+                idx       = n - 1
+                direction = -1
+            elif idx <= 0:
+                idx       = 0
+                direction = +1
+            i_next        = max(0, min(n - 1, idx + direction))
+            lat_a, lon_a  = waypoints[idx]
+            lat_b, lon_b  = waypoints[i_next]
+            dlat          = (lat_b - lat_a) * 111_000
+            dlon          = (lon_b - lon_a) * 111_000 * math.cos(math.radians(lat_a))
+            seg_len_m     = math.hypot(dlat, dlon)
+
+        lat = lat_a + seg_frac * (lat_b - lat_a)
+        lon = lon_a + seg_frac * (lon_b - lon_a)
+
+        # Avance del ciclo: 1 ciclo = ida y vuelta completa
+        total_m = seg_len_m * n if seg_len_m > 0 else 1
+        cycle_pos += advance_m / (2 * total_m)
+
+        _update_queue(pos_queue, (lat, lon))
+        status_queue.put(
+            f"DEMO MAPA  {lat:.6f}N  {lon:.6f}E  sim {sim_speed:.1f} km/h"
+        )
+        time.sleep(dt_s)
 
 
 def _update_queue(q, value):
@@ -384,6 +480,72 @@ class CompassWidget(tk.Canvas):
 
 
 # ──────────────────────────────────────────────────────────────
+# WIDGET SEÑAL DE VELOCIDAD
+# ──────────────────────────────────────────────────────────────
+
+class SpeedSignWidget(tk.Canvas):
+    """
+    Señal de límite de velocidad estilo tráfico español:
+    círculo blanco con borde rojo y número negro en el centro.
+    Cuando no hay límite activo muestra un guión gris.
+    """
+    SIZE = 110
+
+    def __init__(self, parent, **kwargs):
+        super().__init__(parent, width=self.SIZE, height=self.SIZE,
+                         bg="#161b22", highlightthickness=0, **kwargs)
+        self._limit = None
+        self._draw(None)
+
+    def set_limit(self, limit):
+        if limit != self._limit:
+            self._limit = limit
+            self._draw(limit)
+
+    def _draw(self, limit):
+        self.delete("all")
+        cx = cy = self.SIZE // 2
+        r_outer = cx - 4
+        r_inner = r_outer - 7   # grosor del aro rojo
+
+        # Sombra suave
+        self.create_oval(cx - r_outer + 3, cy - r_outer + 3,
+                         cx + r_outer + 3, cy + r_outer + 3,
+                         fill="#000000", outline="")
+
+        if limit is not None:
+            # Aro exterior rojo
+            self.create_oval(cx - r_outer, cy - r_outer,
+                             cx + r_outer, cy + r_outer,
+                             fill="#cc2200", outline="#881100", width=1)
+            # Relleno blanco interior
+            self.create_oval(cx - r_inner, cy - r_inner,
+                             cx + r_inner, cy + r_inner,
+                             fill="#f5f5f5", outline="#dddddd", width=1)
+            # Número
+            digits = len(str(limit))
+            font_size = 28 if digits <= 2 else 22
+            self.create_text(cx, cy,
+                             text=str(limit),
+                             fill="#111111",
+                             font=("Arial", font_size, "bold"))
+            # Etiqueta inferior
+            self.create_text(cx, cy + r_outer + 10,
+                             text="km/h", fill="#8b949e",
+                             font=("Courier", 7))
+        else:
+            # Sin zona: círculo gris apagado con guión
+            self.create_oval(cx - r_outer, cy - r_outer,
+                             cx + r_outer, cy + r_outer,
+                             fill="#1e2730", outline="#30363d", width=2)
+            self.create_text(cx, cy, text="—",
+                             fill="#444d56", font=("Arial", 26, "bold"))
+            self.create_text(cx, cy + r_outer + 10,
+                             text="sin zona", fill="#444d56",
+                             font=("Courier", 7))
+
+
+# ──────────────────────────────────────────────────────────────
 # APLICACIÓN PRINCIPAL
 # ──────────────────────────────────────────────────────────────
 
@@ -391,7 +553,8 @@ class GPSMapApp:
     def __init__(self, root: tk.Tk, args):
         self.root = root
         self.args = args
-        self.root.title("GPS Map Viewer · IGN PNOA")
+        mode_tag = " [DEMO MAPA]" if getattr(args, "demo_map", False) else (" [DEMO]" if args.demo else "")
+        self.root.title(f"GPS Map Viewer · IGN PNOA{mode_tag}")
         self.root.configure(bg="#0d1117")
         self.root.resizable(False, False)
 
@@ -399,14 +562,20 @@ class GPSMapApp:
         self.status_queue = queue.Queue(maxsize=5)
         self.stop_event   = threading.Event()
 
-        self._current_pos  = None
+        self._current_pos      = None   # último punto GPS recibido (destino)
+        self._render_pos       = None   # posición interpolada para renderizar
+        self._interp_start     = None   # origen del segmento de interpolación
+        self._interp_t         = 1.0   # fracción [0,1]; arranca en 1 (sin segmento)
+        self._interp_start_time= 0.0
+        self._interp_duration  = REFRESH_MS / 1000.0
+        self._last_gps_time    = None
         self._prev_pos     = None
         self._prev_time    = None
         self._speed_kmh    = 0.0
         self._heading_deg  = None
         self._tk_image     = None
         self._fetching     = False
-        self._current_limit = None   # límite de velocidad activo (km/h o None)
+        self._current_limit = None
 
         # Cargar zonas de velocidad
         self._speed_zones = _load_speed_zones(getattr(args, 'map', _DEFAULT_MAP_FILE))
@@ -456,6 +625,10 @@ class GPSMapApp:
         self.compass = CompassWidget(bottom)
         self.compass.pack(side="right", padx=8, pady=4)
 
+        # Señal de límite de velocidad (Canvas tkinter, estilo señal ES)
+        self.speed_sign = SpeedSignWidget(bottom)
+        self.speed_sign.pack(side="right", padx=8, pady=4)
+
         # Velocidad + rumbo
         sf = tk.Frame(bottom, bg="#161b22")
         sf.pack(side="right", padx=20, pady=6)
@@ -495,11 +668,18 @@ class GPSMapApp:
     # ── GPS ──────────────────────────────────────────────────
 
     def _start_gps(self):
-        target = demo_thread if self.args.demo else gps_thread
-        args = (self.pos_queue, self.stop_event, self.status_queue) if self.args.demo \
-               else (self.args.port, self.args.baud, self.pos_queue,
-                     self.stop_event, self.status_queue)
-        threading.Thread(target=target, args=args, daemon=True).start()
+        if getattr(self.args, 'demo_map', False):
+            target = map_demo_thread
+            targs  = (self.pos_queue, self.stop_event, self.status_queue,
+                      self.args.map, self.args.demo_speed)
+        elif self.args.demo:
+            target = demo_thread
+            targs  = (self.pos_queue, self.stop_event, self.status_queue)
+        else:
+            target = gps_thread
+            targs  = (self.args.port, self.args.baud, self.pos_queue,
+                      self.stop_event, self.status_queue)
+        threading.Thread(target=target, args=targs, daemon=True).start()
 
     # ── Velocidad / rumbo ────────────────────────────────────
 
@@ -525,11 +705,44 @@ class GPSMapApp:
         self.root.after(REFRESH_MS, self._schedule_refresh)
 
     def _pan_tick(self):
-        # Re-renderiza el recorte del tile en cache segun la posicion actual.
-        # Se ejecuta cada PAN_INTERVAL_MS ms para animar el desplazamiento.
+        """Avanza la posicion de render y re-renderiza el recorte del tile."""
         if self._tile_image is not None and self._current_pos is not None:
+            self._advance_render_pos()
             self._render_current_view()
         self.root.after(PAN_INTERVAL_MS, self._pan_tick)
+
+    def _advance_render_pos(self):
+        """
+        Interpola _render_pos desde _interp_start hacia _current_pos usando
+        tiempo real transcurrido.  t = elapsed / duracion_segmento, donde
+        duracion_segmento es el intervalo real entre los dos ultimos puntos GPS.
+        Esto garantiza que:
+          - El marcador llega al destino exactamente cuando llega el siguiente GPS.
+          - Funciona igual a cualquier frecuencia de GPS (demo rapida o lenta).
+          - No depende de la velocidad calculada (evita el problema de doble
+            interpolacion en la demo de mapa que ya emite a 20 Hz).
+        """
+        if (not hasattr(self, '_interp_start')
+                or self._interp_start is None
+                or self._current_pos is None):
+            return
+
+        if self._interp_t >= 1.0:
+            # Ya hemos llegado al destino; no mover hasta el siguiente GPS
+            return
+
+        elapsed  = time.monotonic() - self._interp_start_time
+        duration = max(getattr(self, '_interp_duration', REFRESH_MS / 1000.0), 0.01)
+        t        = min(1.0, elapsed / duration)
+
+        lat_s, lon_s = self._interp_start
+        lat_d, lon_d = self._current_pos
+
+        self._interp_t   = t
+        self._render_pos = (
+            lat_s + t * (lat_d - lat_s),
+            lon_s + t * (lon_d - lon_s),
+        )
 
     def _poll_status(self):
         msgs = []
@@ -547,8 +760,42 @@ class GPSMapApp:
         except queue.Empty:
             return
 
+        now = time.monotonic()
         self._compute_motion(pos)
+
+        # ── Interpolación suave ──────────────────────────────
+        # Al llegar un nuevo punto GPS arrancamos un segmento de interpolación
+        # desde la posición de render actual hasta el nuevo punto GPS.
+        # La duración del segmento es el intervalo real entre los dos últimos
+        # puntos GPS, medido con time.monotonic().
+        prev_gps = self._current_pos
         self._current_pos = pos
+
+        if prev_gps is None or self._render_pos is None:
+            # Primera posición: sin animación, saltar directamente
+            self._render_pos        = pos
+            self._interp_start      = pos
+            self._interp_t          = 1.0
+            self._interp_start_time = now
+            self._interp_duration   = REFRESH_MS / 1000.0
+        else:
+            # Intervalo real entre este GPS y el anterior
+            dt = (now - self._last_gps_time) if self._last_gps_time is not None else REFRESH_MS / 1000.0
+            # Si el GPS llega más rápido que el pan_tick (ej. demo 20 Hz)
+            # la interpolación no aporta suavidad; saltar directamente.
+            if dt <= PAN_INTERVAL_MS / 1000.0:
+                self._render_pos        = pos
+                self._interp_start      = pos
+                self._interp_t          = 1.0
+                self._interp_start_time = now
+                self._interp_duration   = dt
+            else:
+                self._interp_start      = self._render_pos
+                self._interp_t          = 0.0
+                self._interp_start_time = now
+                self._interp_duration   = max(dt, 0.01)
+
+        self._last_gps_time = now
         lat, lon = pos
 
         self.lbl_coords.configure(text=f"Lat {lat:.6f}°  Lon {lon:.6f}°")
@@ -558,6 +805,7 @@ class GPSMapApp:
         self._current_limit = limit
         spd_color = _speed_color(self._speed_kmh, limit) if limit is not None else "#e6edf3"
         self.lbl_speed.configure(text=f"{self._speed_kmh:.1f} km/h", fg=spd_color)
+        self.speed_sign.set_limit(limit)
 
         if self._heading_deg is not None:
             cardinal = bearing_to_cardinal(self._heading_deg)
@@ -610,10 +858,10 @@ class GPSMapApp:
             text=f"✔ Actualizado {time.strftime('%H:%M:%S')}")
 
     def _render_current_view(self):
-        # Recorta el tile grande centrado en la posicion GPS actual y lo muestra.
-        if self._tile_image is None or self._current_pos is None:
+        # Recorta el tile grande centrado en la posicion interpolada y lo muestra.
+        if self._tile_image is None or self._render_pos is None:
             return
-        lat, lon     = self._current_pos
+        lat, lon     = self._render_pos
         tlat, tlon   = self._tile_center
         tile_w, tile_h = self._tile_image.size
 
@@ -648,31 +896,69 @@ class GPSMapApp:
                                 fill="white", font=("Courier", 9, "bold"))
 
     def _draw_speed_overlay(self):
-        """Caja semitransparente con velocidad, límite y rumbo sobre la esquina del mapa."""
-        limit = self._current_limit
+        """
+        Overlay en la esquina superior derecha del mapa:
+          - Señal de velocidad estilo tráfico (círculo rojo/blanco) con el límite
+          - Velocidad actual coloreada debajo
+          - Rumbo
+        """
+        limit     = self._current_limit
         spd_color = _speed_color(self._speed_kmh, limit) if limit is not None else "#e6edf3"
 
-        # Altura variable según si hay límite
-        box_h = 72 if limit is not None else 52
-        x, y, w, h = MAP_WIDTH - 160, 10, 148, box_h
-        self.canvas.create_rectangle(x, y, x+w, y+h,
+        # ── Caja de fondo ──────────────────────────────────────
+        box_w, box_h = 118, 118
+        bx = MAP_WIDTH - box_w - 10
+        by = 10
+        self.canvas.create_rectangle(bx, by, bx + box_w, by + box_h,
                                      fill="#0d1117", outline="#30363d",
                                      stipple="gray50")
-        self.canvas.create_text(x+w//2, y+15,
-                                text=f"{self._speed_kmh:.1f} km/h",
-                                fill=spd_color, font=("Courier", 14, "bold"))
+
+        # ── Señal circular ─────────────────────────────────────
+        sign_r = 36          # radio exterior de la señal
+        cx     = bx + box_w // 2
+        cy     = by + 10 + sign_r
+
+        # sombra
+        self.canvas.create_oval(cx - sign_r + 2, cy - sign_r + 2,
+                                cx + sign_r + 2, cy + sign_r + 2,
+                                fill="#000000", outline="")
         if limit is not None:
-            self.canvas.create_text(x+w//2, y+34,
-                                    text=f"Límite: {limit} km/h",
-                                    fill="#8b949e", font=("Courier", 10))
-            row3_y = y + 54
+            # aro rojo
+            self.canvas.create_oval(cx - sign_r, cy - sign_r,
+                                    cx + sign_r, cy + sign_r,
+                                    fill="#cc2200", outline="#881100", width=1)
+            # relleno blanco
+            inner_r = sign_r - 7
+            self.canvas.create_oval(cx - inner_r, cy - inner_r,
+                                    cx + inner_r, cy + inner_r,
+                                    fill="#f5f5f5", outline="")
+            # número
+            digits    = len(str(limit))
+            font_size = 20 if digits <= 2 else 16
+            self.canvas.create_text(cx, cy,
+                                    text=str(limit),
+                                    fill="#111111",
+                                    font=("Arial", font_size, "bold"))
         else:
-            row3_y = y + 36
+            # sin zona — círculo gris
+            self.canvas.create_oval(cx - sign_r, cy - sign_r,
+                                    cx + sign_r, cy + sign_r,
+                                    fill="#1e2730", outline="#30363d", width=2)
+            self.canvas.create_text(cx, cy, text="—",
+                                    fill="#444d56", font=("Arial", 18, "bold"))
+
+        # ── Velocidad actual ────────────────────────────────────
+        spd_y = cy + sign_r + 14
+        self.canvas.create_text(cx, spd_y,
+                                text=f"{self._speed_kmh:.1f} km/h",
+                                fill=spd_color, font=("Courier", 12, "bold"))
+
+        # ── Rumbo ───────────────────────────────────────────────
         if self._heading_deg is not None:
             cardinal = bearing_to_cardinal(self._heading_deg)
-            self.canvas.create_text(x+w//2, row3_y,
+            self.canvas.create_text(cx, spd_y + 18,
                                     text=f"{self._heading_deg:.0f}° {cardinal}",
-                                    fill="#ffd700", font=("Courier", 11))
+                                    fill="#ffd700", font=("Courier", 10))
 
     # ── Cierre ───────────────────────────────────────────────
 
@@ -693,6 +979,11 @@ def main():
                         help="Baudrate del GPS (por defecto 9600)")
     parser.add_argument("--demo", action="store_true",
                         help="Modo demo sin GPS real (simula posición en Madrid)")
+    parser.add_argument("--demo-map", dest="demo_map", action="store_true",
+                        help="Demo que recorre los puntos de Mapa_INSIA2.txt "
+                             "con velocidad variable para probar los limites")
+    parser.add_argument("--demo-speed", dest="demo_speed", type=float, default=15.0,
+                        help="Velocidad base en km/h para el modo --demo-map (default: 15)")
     parser.add_argument("--map", default=_DEFAULT_MAP_FILE,
                         help="Ruta al fichero de zonas de velocidad (Mapa_INSIA2.txt)")
     args = parser.parse_args()
