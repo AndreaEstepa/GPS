@@ -1,5 +1,4 @@
 pyserial
 pynmea2
-pyproj
-matplotlib
-
+requests
+Pillow
